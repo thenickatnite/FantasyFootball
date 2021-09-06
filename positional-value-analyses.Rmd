@@ -1,0 +1,132 @@
+---
+title: "Positional Ranking and Quick Analyses"
+author: "Nick Brown"
+date: "9/6/2021"
+output: html_document
+---
+
+### Positional Value in 0.5 PPR
+In fantasy football the draft makes or breaks a season (as well as other things
+like waiver wire pickups). You cannot win a season with the draft alone, but you
+can lose the season. So the draft has an outsized effect on a player's success in
+fantasy football. The key to effective drafting comes from positional value. This
+quick code and plot will hopefully demonstrate a couple of things:
+
+1. The tight end (TE) position is scarce of big producers, and is relatively thin.
+This places value on the TE position.
+2. Quarterback (QB) value is relatively low. Most starting quarterbacks are relatively
+close in points and therefore a top quarterback has less value than a top tight end.
+3. Wide receivers tend to be the most consistent. There seems to be little difference
+among wideouts once you move past the top 4 or 5.
+4. Top running backs are rare, but if you can't grab one of the top 3, the value is relatively similar. 
+
+These are all statements that have been shown and said before. I just wanted to 
+formalize my analysis here. First we will need to load the necessary libraries:
+```{R}
+# Necessary Libraries 
+library(tidyverse)
+library(nflfastR)
+library(DBI)
+library(RSQLite)
+```
+The tidyverse will be used for data wrangling, nflfastR for quick data pulling,
+DBI and RSQLite for data base use. NflFastR has an option to create a local database
+with all of it's play-by-play data. I have created this, for more info look to 
+NflFastR. 
+
+With the packages load, we will now want to create a function that derives fantasy
+points for the half point point per reception (0.5 PPR) leagues. NflfastR will calculate fantasy points for standard and PPR leagues with a built-in function, however there is no option for 0.5 PPR (the league I play in). So I wrote one that take NflFastR's standard fantasy point calculation and then adds the requisite points for 0.5 PPR. Here that is:
+```{R}
+# Function for 0.5 ppr
+HalfPointPPR <- function( df ){
+  df <- df %>% 
+    dplyr::mutate( fantasy_points_HP_ppr = fantasy_points + ( 0.5 * receptions ) )
+  
+  return( df )
+}
+```
+
+Now we can get into the basic coding and analysis. I am using a database that nflfastR creates and is in my current working directory. From this database I am creating a connection and then using dplyr's built-in functionality with databases and SQL to filter to just the 2020 season (for more info on this, see documentation from dplyr or nflfastR). 
+```{R}
+# Set up data base connection and update DB
+wd <- '/Users/NickBrown/Desktop/FantasyFootball'
+nflfastR::update_db( dbdir = wd )
+
+connection <- DBI::dbConnect( RSQLite::SQLite(), '/Users/NickBrown/Desktop/FantasyFootball/pbp_db' )
+
+# Get output from database
+pbp_db <- dplyr::tbl( connection, 'nflfastR_pbp' )
+
+# Get 2020 data
+pbp_2020 <- pbp_db %>% 
+  dplyr::filter( season == 2020 ) %>% 
+  dplyr::collect()
+
+DBI::dbDisconnect( connection )
+```
+
+Now I have collected the 2020 season play-by-play data into memory for quick calculations and work. Now we will want to get 2020 full season fantasy stats. This is easy using nflfastR's built-in calculate_player_stats function and the 0.5 ppr function that was written earlier. 
+```{R}
+# Now get 2020 fantasy stats
+top_fp_2020 <- pbp_2020 %>% 
+  dplyr::filter( week <= 16 ) %>% 
+  nflfastR::calculate_player_stats() %>% 
+  HalfPointPPR() %>% 
+  dplyr::mutate(
+    ppg = fantasy_points_HP_ppr / games
+  ) %>% 
+  dplyr::filter( games > 5, 
+                 fantasy_points_HP_ppr > 10) %>% # filtering to 5 games and more than 10 points to reduce number of players
+  dplyr::inner_join(
+    nflfastR::fast_scraper_roster( 2020 ) %>% select( gsis_id, position ),
+    by = c( "player_id" = "gsis_id" )
+  )
+
+head(top_fp_2020)
+```
+
+As you can see we get a data frame with plenty of season stats for NFL players. We now want to get the best 25 players from each position grouping. This is easiestly done using a function and a lapply, then binding rows. The function is below:
+```{R}
+top25PlayersPos <- function( df, pos ){
+  pos <- as.character(pos)
+  
+  df <- df %>% 
+    dplyr::filter(position == !!pos) %>% 
+    dplyr::arrange(-fantasy_points_HP_ppr) %>% 
+    dplyr::select(player_name, position, games, fantasy_points_HP_ppr) %>% 
+    dplyr::mutate( Ranking = as.numeric(row.names(.))) %>% 
+    utils::head(25)
+  
+  return(df)
+}
+```
+This function will take a dataframe and position indicator, and will then filter down to the chosen position, arrange from most fantasy points to least, and take the 25 entries with the most fantasy points in the 2020 season. It also creates a ranking column that will be used in plotting. With the function created, we will now create a list with the position groups we want to evaluate, lapply this function over that list using our previously created data frame from above, and then bind the rows of these four list objects to create one dataframe that will serve as the basis for our plots.
+
+```{R}
+positions <- list('QB', 'RB', 'WR', 'TE')
+topPlayersDf <- lapply(positions, top25PlayersPos, df = top_fp_2020) %>% 
+  dplyr::bind_rows()
+
+head(topPlayersDf)
+```
+
+Since QB was the first list object we can see the top of our data frame only reflects quarterbacks. Nonetheless, it's all there. We can now plot. We want to plot the ranking of a position group on the x-axis with the season fantasy point total on the y-axis. The position grouping a player belongs to will serve as our grouping and color indicator.
+```{R}
+# Now Plot
+ggplot(data = topPlayersDf, aes(x = Ranking, y = fantasy_points_HP_ppr,
+                                group = position, color = position)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  labs(title = 'Top 25 Players by Position',
+       subtitle = '2020 Season (0.5 PPR)') +
+  xlab('Player Ranking') +
+  ylab('Total Fantasy Points')
+
+# Saving the plot we generated. 
+plotName <- 'positionRanking.png'
+plotFpath <- file.path(wd, plotName)
+ggsave(plotFpath)
+```
+
+From this plot we can see the points ellucidated from above. The tight end position suffers a steep drop off from the top player to the third best player and then the remaining options have low point totals. Quarterbacks are highest point-getters and remain high for the majority of selections. The top-3 running backs are great value but then the position begins to drop. Wide receivers are much more robust, with less upside but less degredation as you move further from the top options. 
